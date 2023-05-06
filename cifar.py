@@ -33,12 +33,21 @@ import numpy as np
 from third_party.ResNeXt_DenseNet.models.densenet import densenet
 from third_party.ResNeXt_DenseNet.models.resnext import resnext29
 from third_party.WideResNet_pytorch.wideresnet import WideResNet
+from torch.utils.tensorboard import SummaryWriter
+
 
 import torch
+from torch import nn
+from torch import optim
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
+
+import torchvision
 from torchvision import datasets
 from torchvision import transforms
+from torchvision import models
+
+import matplotlib.pyplot as plt
 
 parser = argparse.ArgumentParser(
     description='Trains a CIFAR Classifier',
@@ -50,11 +59,25 @@ parser.add_argument(
     choices=['cifar10', 'cifar100'],
     help='Choose between CIFAR-10, CIFAR-100.')
 parser.add_argument(
+    '--scheduler',
+    '--sch',
+    type=str,
+    default='lambda_lr',
+    choices=['lambda_lr', 'cos_ann'],
+    help='Choose between lambda_lr, cos_ann.')
+parser.add_argument(
+    '--optimizer',
+    '--opt',
+    type=str,
+    default='SGD',
+    choices=['SGD', 'Adamw'],
+    help='Choose between SGD, Adamw.')
+parser.add_argument(
     '--model',
     '-m',
     type=str,
     default='wrn',
-    choices=['wrn', 'allconv', 'densenet', 'resnext'],
+    choices=['wrn', 'allconv', 'densenet', 'resnext','resnet18_npt' , 'resnet18_pt' , 'convnext_npt' , 'convnext_pt'],
     help='Choose architecture.')
 # Optimization options
 parser.add_argument(
@@ -134,6 +157,7 @@ parser.add_argument(
     help='Number of pre-fetching threads.')
 
 args = parser.parse_args()
+num_classes = 10 
 
 CORRUPTIONS = [
     'gaussian_noise', 'shot_noise', 'impulse_noise', 'defocus_blur',
@@ -142,6 +166,10 @@ CORRUPTIONS = [
     'jpeg_compression'
 ]
 
+PERTURBATIONS = ['gaussian_noise', 'shot_noise', 'motion_blur', 'zoom_blur',
+                 'spatter', 'brightness', 'translate', 'rotate', 'tilt', 'scale']
+
+writer = SummaryWriter('logs/'+args.model)
 
 def get_lr(step, total_steps, lr_max, lr_min):
   """Compute learning rate according to cosine annealing schedule."""
@@ -285,6 +313,59 @@ def test_c(net, test_data, base_path):
 
   return np.mean(corruption_accs)
 
+concat = lambda x: np.concatenate(x, axis=0)
+to_np = lambda x: x.data.to('cpu').numpy()
+
+def evaluate(net,loader):
+    confidence = []
+    correct = []
+
+    num_correct = 0
+    with torch.no_grad():
+        for data, target in loader:
+            data, target = data.cuda(), target.cuda()
+            output = net(2 * data - 1)
+
+            # accuracy
+            pred = output.data.max(1)[1]
+            num_correct += pred.eq(target.data).sum().item()
+
+            confidence.extend(to_np(F.softmax(output, dim=1).max(1)[0]).squeeze().tolist())
+            pred = output.data.max(1)[1]
+            correct.extend(pred.eq(target).to('cpu').numpy().squeeze().tolist())
+
+    return num_correct / len(loader.dataset), np.array(confidence), np.array(correct)
+
+args.difficulty = 1
+identity = np.asarray(range(1, num_classes+1))
+cum_sum_top5 = np.cumsum(np.asarray([0] + [1] * 5 + [0] * (num_classes-1 - 5)))
+recip = 1./identity
+
+
+def dist(sigma, mode='top5'):
+    if mode == 'top5':
+        return np.sum(np.abs(cum_sum_top5[:5] - cum_sum_top5[sigma-1][:5]))
+    elif mode == 'zipf':
+        return np.sum(np.abs(recip - recip[sigma-1])*recip)
+
+def flip_prob(predictions, noise_perturbation=False):
+    result = 0
+    step_size = 1 if noise_perturbation else args.difficulty
+
+    for vid_preds in predictions:
+        result_for_vid = []
+
+        for i in range(step_size):
+            prev_pred = vid_preds[i]
+
+            for pred in vid_preds[i::step_size][1:]:
+                result_for_vid.append(int(prev_pred != pred))
+                if not noise_perturbation: prev_pred = pred
+
+        result += np.mean(result_for_vid) / len(predictions)
+
+    return result
+
 
 def main():
   torch.manual_seed(1)
@@ -338,13 +419,38 @@ def main():
     net = AllConvNet(num_classes)
   elif args.model == 'resnext':
     net = resnext29(num_classes=num_classes)
+  elif args.model == 'resnet18_npt':
+    net = models.resnet18(pretrained=True)
+    net.fc = nn.Linear(net.fc.in_features, num_classes)  
+    nn.init.xavier_uniform_(net.fc.weight) 
+  elif args.model == 'resnet18_pt':
+    net = models.resnet18(pretrained=True)
+    net.fc = nn.Linear(net.fc.in_features,10)
+    nn.init.xavier_uniform_(net.fc.weight)
+  elif args.model == 'convnext_npt':
+    net = torchvision.models.convnext_tiny(pretrained=False)
+    net.fc = nn.Linear(in_features=768,out_features=10)
+  elif args.model == 'convnext_pt':
+    net = torchvision.models.convnext_tiny(pretrained=True)
+    net.fc = nn.Linear(in_features=768,out_features=10)
+  elif args.model == 'resnet18_npt':
+    net = models.resnet18(pretrained=True)
+    net.fc = nn.Linear(512, num_classes)
 
-  optimizer = torch.optim.SGD(
+  if args.optimizer == 'SGD':
+    optimizer = torch.optim.SGD(
       net.parameters(),
       args.learning_rate,
       momentum=args.momentum,
       weight_decay=args.decay,
       nesterov=True)
+  elif args.optimizer == 'Adamw':
+    optimizer = torch.optim.AdamW(
+      net.parameters(), 
+      args.learning_rate, 
+      betas=(0.9,0.999),
+      eps=1e-08,
+      weight_decay=args.decay)
 
   # Distribute model across all visible GPUs
   net = torch.nn.DataParallel(net).cuda()
@@ -371,13 +477,19 @@ def main():
     print('Mean Corruption Error: {:.3f}'.format(100 - 100. * test_c_acc))
     return
 
-  scheduler = torch.optim.lr_scheduler.LambdaLR(
+  if args.scheduler == 'lambda_lr':
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
       optimizer,
       lr_lambda=lambda step: get_lr(  # pylint: disable=g-long-lambda
           step,
           args.epochs * len(train_loader),
           1,  # lr_lambda computes multiplicative factor
           1e-6 / args.learning_rate))
+  
+  elif args.scheduler == 'cos_ann':
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+      optimizer, T_max = len(train_loader)*args.epochs, 
+                            eta_min=0, last_epoch=- 1, verbose=False)
 
   if not os.path.exists(args.save):
     os.makedirs(args.save)
@@ -422,6 +534,10 @@ def main():
           100 - 100. * test_acc,
       ))
 
+    writer.add_scalar('logs/train', train_loss_ema, epoch+1)
+    writer.add_scalar('logs/test', test_loss, epoch+1)
+    writer.add_scalar('acc/test', test_acc, epoch+1)
+
     print(
         'Epoch {0:3d} | Time {1:5d} | Train Loss {2:.4f} | Test Loss {3:.3f} |'
         ' Test Error {4:.2f}'
@@ -434,6 +550,52 @@ def main():
   with open(log_path, 'a') as f:
     f.write('%03d,%05d,%0.6f,%0.5f,%0.2f\n' %
             (args.epochs + 1, 0, 0, 0, 100 - 100 * test_c_acc))
+    
+
+  # /////////////// Get Results ///////////////
+
+  c_p_dir = './data/cifar/CIFAR-10-P'
+  num_classes = 10
+  dummy_targets = torch.LongTensor(np.random.randint(0, num_classes, (10000,)))
+  flip_list = []
+  zipf_list = []
+
+  for p in PERTURBATIONS :
+
+    dataset = torch.from_numpy(np.float32(np.load(os.path.join('./data/cifar/CIFAR-10-P/' + p + '.npy')).transpose((0,1,4,2,3))))/255.
+
+    ood_data = torch.utils.data.TensorDataset(dataset, dummy_targets)
+
+    loader = torch.utils.data.DataLoader(
+            dataset, batch_size=25, shuffle=False, num_workers=2, pin_memory=True)
+
+    predictions, ranks = [], []
+
+    with torch.no_grad():
+
+        for data in loader:
+            num_vids = data.size(0)
+            data = data.view(-1,3,32,32).cuda()
+
+            output = net(data * 2 - 1)
+
+            for vid in output.view(num_vids, -1, num_classes):
+                predictions.append(vid.argmax(1).to('cpu').numpy())
+                ranks.append([np.uint16(rankdata(-frame, method='ordinal')) for frame in vid.to('cpu').numpy()])
+
+        ranks = np.asarray(ranks)
+
+        current_flip = flip_prob(predictions, True if 'noise' in p else False)
+        flip_list.append(current_flip)
+
+        print('\n' + p, 'Flipping Prob')
+        print(current_flip)
+        
+
+  print(flip_list)
+  print('\nMean Flipping Prob\t{:.5f}'.format(np.mean(flip_list)))
+
+  acc, test_confidence, test_correct = evaluate(net, test_loader)
 
 
 if __name__ == '__main__':
